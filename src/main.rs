@@ -1,14 +1,10 @@
+#![feature(exit_status_error)]
+use konst::{primitive::parse_u64, unwrap_ctx};
 use serenity::{
     async_trait,
     client::{Client, Context, EventHandler},
-    framework::{
-        standard::{
-            macros::{command, group},
-            CommandResult,
-        },
-        StandardFramework,
-    },
-    model::channel::Message,
+    framework::StandardFramework,
+    model::{guild::Guild, id::UserId},
 };
 use songbird::{
     input::{Codec, Container, Input},
@@ -17,56 +13,37 @@ use songbird::{
 use std::{
     env,
     process::{Command, Stdio},
+    time::Duration,
 };
 
-#[group]
-#[commands(join)]
-struct General;
+const USER_ID: UserId = UserId(unwrap_ctx!(parse_u64(env!("DISCORD_USER"))));
 
 struct Handler;
 
-#[tokio::main]
-async fn main() {
-    let token = env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN have to be set");
-    let framework = StandardFramework::new()
-        .configure(|c| c.prefix("~"))
-        .group(&GENERAL_GROUP);
-
-    let mut client = Client::builder(&token)
-        .event_handler(Handler)
-        .framework(framework)
-        .register_songbird()
-        .await
-        .expect("Failed to create client");
-    let _ = client
-        .start()
-        .await
-        .map_err(|err| println!("error: {:?}", err));
-}
-
 #[async_trait]
-impl EventHandler for Handler {}
+impl EventHandler for Handler {
+    async fn guild_create(&self, ctx: Context, guild: Guild, _is_new: bool) {
+        pa_create_null_sink("audst");
+        let connect_to = match guild
+            .voice_states
+            .get(&USER_ID)
+            .and_then(|vs| vs.channel_id)
+        {
+            Some(channel) => channel,
+            None => return,
+        };
 
-#[command]
-async fn join(ctx: &Context, msg: &Message) -> CommandResult {
-    let guild = msg.guild(&ctx.cache).await.unwrap();
-    let channel_id = guild
-        .voice_states
-        .get(&msg.author.id)
-        .and_then(|vs| vs.channel_id);
-    let connect_to = match channel_id {
-        Some(channel) => channel,
-        None => {
-            return Ok(());
-        }
-    };
-    let manager = songbird::get(ctx)
-        .await
-        .expect("Failed to create voice client");
-    let _ = manager.join(guild.id, connect_to).await;
-    if let Some(handler) = manager.get(guild.id) {
+        let manager = songbird::get(&ctx)
+            .await
+            .expect("Failed to create voice client");
+
+        let (_, err) = manager.join(guild.id, connect_to).await;
+        err.expect("Failed to join the voice channel");
+        let handler = manager
+            .get(guild.id)
+            .expect("Failed to obtain the connection");
         let mut handler = handler.lock().await;
-        let recorder = Command::new("parec")
+        let mut recorder = Command::new("parec")
             .args(&[
                 "--format=float32le",
                 "--rate=48000",
@@ -79,7 +56,13 @@ async fn join(ctx: &Context, msg: &Message) -> CommandResult {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .spawn()
-            .unwrap();
+            .expect("Failed to spawn `parec`");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        match recorder.try_wait() {
+            Ok(Some(status)) => panic!("`parec` exited with status {}", status),
+            Ok(None) => (),
+            Err(e) => panic!("Failed to check `parec`'s status: {}", e),
+        };
         let source = Input::new(
             false,
             recorder.into(),
@@ -88,8 +71,44 @@ async fn join(ctx: &Context, msg: &Message) -> CommandResult {
             Default::default(),
         );
         handler.play_source(source);
-    } else {
-        panic!("");
     }
-    Ok(())
+}
+
+#[tokio::main]
+async fn main() {
+    let token = env!("DISCORD_TOKEN");
+    let framework = StandardFramework::new();
+    let mut client = Client::builder(&token)
+        .event_handler(Handler)
+        .framework(framework)
+        .register_songbird()
+        .await
+        .expect("Failed to create client");
+    let _ = client
+        .start()
+        .await
+        .map_err(|err| println!("error: {:?}", err));
+}
+
+fn pa_create_null_sink(name: &str) {
+    let out = Command::new("pactl")
+        .args(&["list", "short", "modules"])
+        .output()
+        .expect("Failed to get modules");
+    out.status.exit_ok().expect("Failed to get modules");
+    let out = String::from_utf8(out.stdout).expect("Invalid UTF-8");
+    let sink_exists = out.lines().find(|line| line.contains(name)).is_some();
+    if sink_exists {
+        return;
+    }
+    Command::new("pactl")
+        .args(&[
+            "load-module",
+            "module-null-sink",
+            &format!("sink_name={}", name),
+        ])
+        .status()
+        .expect("Failed to create null sink")
+        .exit_ok()
+        .expect("Failed to create null sink");
 }
