@@ -6,7 +6,8 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+dialoguer = "0.9.0"
 konst = "0.2.4"
 serenity = { version = "0.10.8", features = ["voice"] }
 songbird = { version = "0.1.8", features = [] }
-tokio = { version = "1.8.1", features = ["rt-multi-thread", "signal"] }
+tokio = { version = "1.8.1", features = ["rt", "rt-multi-thread", "signal"] }
