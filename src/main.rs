@@ -1,4 +1,5 @@
 #![feature(exit_status_error)]
+use clap::Parser;
 use dialoguer::Select;
 use konst::{primitive::parse_u64, unwrap_ctx};
 use serenity::{
@@ -6,6 +7,7 @@ use serenity::{
     client::{Client, Context, EventHandler},
     framework::StandardFramework,
     model::{guild::Guild, id::UserId},
+    prelude::TypeMapKey,
 };
 use songbird::{
     input::{Codec, Container, Input},
@@ -20,6 +22,20 @@ use std::{
 };
 
 const USER_ID: UserId = UserId(unwrap_ctx!(parse_u64(env!("DISCORD_USER"))));
+
+#[derive(Parser)]
+#[clap(version, author = "Yuki Takagi <takagiy.4dev@gmail.com>")]
+struct Opts {
+    /// Use JACK instead of PulseAudio to listen to applications
+    #[clap(short, long)]
+    jack: bool,
+}
+
+struct OptsKey;
+
+impl TypeMapKey for OptsKey {
+    type Value = Opts;
+}
 
 struct Handler;
 
@@ -45,13 +61,23 @@ impl EventHandler for Handler {
             .get(guild.id)
             .expect("Failed to obtain the connection");
         let mut handler = handler.lock().await;
+        let source_device;
+        {
+            let data = ctx.data.read().await;
+            let opts = data.get::<OptsKey>().unwrap();
+            source_device = if opts.jack {
+                "audst_jack"
+            } else {
+                "audst.monitor"
+            };
+        }
         let mut recorder = Command::new("parec")
             .args(&[
                 "--format=float32le",
                 "--rate=48000",
                 "--channels=2",
                 "-d",
-                "audst.monitor",
+                source_device,
                 "-r",
             ])
             .stderr(Stdio::null())
@@ -86,39 +112,44 @@ impl EventHandler for Handler {
 
 #[tokio::main]
 async fn main() {
-    pa_load_once(&["module-null-sink", "sink_name=audst"]);
-    tokio::task::spawn_blocking(|| {
-        let mut old_sink = 0;
-        loop {
-            let mut sinks = vec![
-                "Don't create loopback".to_owned(),
-                "@DEFAULT_SINK@".to_owned(),
-            ];
-            sinks.extend(pa_get_sinks());
-            let new_sink = Select::new()
-                .with_prompt("Output device")
-                .items(&sinks)
-                .default(0)
-                .clear(true)
-                .interact()
-                .unwrap();
-            if old_sink != 0 {
-                pa_unload_module(&[
-                    "module-loopback",
-                    "source=audst.monitor",
-                    &format!("sink={}", &sinks[old_sink]),
-                ]);
+    let opts = Opts::parse();
+    let mut workers = Vec::new();
+    if opts.jack {
+        pa_load_once(&["module-jack-source", "source_name=audst_jack"]);
+    } else {
+        pa_load_once(&["module-null-sink", "sink_name=audst"]);
+        workers.push(tokio::task::spawn_blocking(|| {
+            let mut loopback_to = 0;
+            loop {
+                let sinks = {
+                    let mut sinks = vec![
+                        "Don't create loopback".to_owned(),
+                        "@DEFAULT_SINK@".to_owned(),
+                    ];
+                    sinks.extend(pa_get_sinks());
+                    sinks
+                };
+                pa_unload_module(&["module-loopback", "source=audst.monitor"]);
+                if loopback_to != 0 {
+                    pa_load_once(&[
+                        "module-loopback",
+                        "source=audst.monitor",
+                        &format!("sink={}", &sinks[loopback_to]),
+                    ]);
+                }
+                loopback_to = match Select::new()
+                    .with_prompt("Output device")
+                    .items(&sinks)
+                    .default(0)
+                    .clear(true)
+                    .interact() {
+                        Ok(selection) => selection,
+                        Err(_) => break,
+                    };
             }
-            if new_sink != 0 {
-                pa_load_once(&[
-                    "module-loopback",
-                    "source=audst.monitor",
-                    &format!("sink={}", &sinks[new_sink]),
-                ]);
-            }
-            old_sink = new_sink;
-        }
-    });
+            let _ = console::Term::stderr().show_cursor();
+        }));
+    };
     let token = env!("DISCORD_TOKEN");
     let framework = StandardFramework::new();
     let mut client = Client::builder(&token)
@@ -127,10 +158,19 @@ async fn main() {
         .register_songbird()
         .await
         .expect("Failed to create client");
-    let _ = client
-        .start()
-        .await
-        .map_err(|err| println!("error: {:?}", err));
+    {
+        let mut data = client.data.write().await;
+        data.insert::<OptsKey>(opts);
+    }
+    workers.push(tokio::spawn(async move {
+        if let Err(err) = client.start().await {
+            println!("error: {:?}", err);
+        }
+    }));
+    tokio::signal::ctrl_c().await.unwrap();
+    for worker in workers {
+        worker.abort();
+    }
 }
 
 fn pa_load_once(args: &[&str]) {
