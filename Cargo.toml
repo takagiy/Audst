@@ -14,3 +14,4 @@ konst = "0.2.4"
 serenity = { version = "0.10.8", features = ["voice"] }
 songbird = { version = "0.1.8", features = [] }
 tokio = { version = "1.8.1", features = ["rt", "rt-multi-thread", "signal"] }
+jack = "0.8.2"

@@ -1,6 +1,7 @@
 #![feature(exit_status_error)]
 use clap::Parser;
 use dialoguer::Select;
+use jack::{ClientOptions, PortFlags};
 use konst::{primitive::parse_u64, unwrap_ctx};
 use serenity::{
     async_trait,
@@ -11,14 +12,14 @@ use serenity::{
 };
 use songbird::{
     input::{Codec, Container, Input},
-    SerenityInit,
+    SerenityInit, Call,
 };
 use std::{
     env,
     future::Future,
     io::Read,
     process::{Child, Command, ExitStatus, Stdio},
-    time::Duration,
+    time::Duration, sync::Arc,
 };
 
 const USER_ID: UserId = UserId(unwrap_ctx!(parse_u64(env!("DISCORD_USER"))));
@@ -60,7 +61,6 @@ impl EventHandler for Handler {
         let handler = manager
             .get(guild.id)
             .expect("Failed to obtain the connection");
-        let mut handler = handler.lock().await;
         let source_device;
         {
             let data = ctx.data.read().await;
@@ -71,6 +71,11 @@ impl EventHandler for Handler {
                 "audst.monitor"
             };
         }
+        play_source(handler, source_device).await;
+    }
+}
+
+async fn play_source(handler: Arc<tokio::sync::Mutex<Call>>, source_device: &str) {
         let mut recorder = Command::new("parec")
             .args(&[
                 "--format=float32le",
@@ -95,10 +100,10 @@ impl EventHandler for Handler {
             };
         }
         // discard accumulated bytes
-        recorder.stdout.as_mut().map(|stdout| {
+        if let Some(stdout) = recorder.stdout.as_mut() {
             let mut buffer = vec![0; 48 * TIMEOUT * 2 * 4];
             let _ = stdout.read_exact(&mut buffer);
-        });
+        }
         let source = Input::new(
             true,
             recorder.into(),
@@ -106,18 +111,24 @@ impl EventHandler for Handler {
             Container::Raw,
             Default::default(),
         );
+        let mut handler = handler.lock().await;
         handler.play_source(source);
     }
-}
 
 #[tokio::main]
 async fn main() {
     let opts = Opts::parse();
     let mut workers = Vec::new();
     if opts.jack {
-        pa_load_once(&["module-jack-source", "source_name=audst_jack"]);
+        pa_load_once(&["module-jack-source", "source_name=audst_jack", "client_name=\"Audst\\ REC\""]);
+        let jack = jack::Client::new("Audst", ClientOptions::NO_START_SERVER).expect("Failed to create JACK client").0;
+        for name in jack.ports(Some("^Audst REC:"), None, PortFlags::empty()) {
+            if let Some(port) = jack.port_by_name(&name) {
+                jack.disconnect(&port).expect("Failed to manipulate port connections");
+            }
+        }
     } else {
-        pa_load_once(&["module-null-sink", "sink_name=audst"]);
+        pa_load_once(&["module-null-sink", "sink_name=audst", "sink_properties=device.description=\"Audst\\ REC\""]);
         workers.push(tokio::task::spawn_blocking(|| {
             let mut loopback_to = 0;
             loop {
