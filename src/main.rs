@@ -12,14 +12,15 @@ use serenity::{
 };
 use songbird::{
     input::{Codec, Container, Input},
-    SerenityInit, Call,
+    Call, SerenityInit,
 };
 use std::{
     env,
     future::Future,
     io::Read,
     process::{Child, Command, ExitStatus, Stdio},
-    time::Duration, sync::Arc,
+    sync::Arc,
+    time::Duration,
 };
 
 const USER_ID: UserId = UserId(unwrap_ctx!(parse_u64(env!("DISCORD_USER"))));
@@ -76,90 +77,74 @@ impl EventHandler for Handler {
 }
 
 async fn play_source(handler: Arc<tokio::sync::Mutex<Call>>, source_device: &str) {
-        let mut recorder = Command::new("parec")
-            .args(&[
-                "--format=float32le",
-                "--rate=48000",
-                "--channels=2",
-                "-d",
-                source_device,
-                "-r",
-            ])
-            .stderr(Stdio::null())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("Failed to spawn `parec`");
-        // ensure that the process is alive
-        const TIMEOUT: usize = 50;
-        let status = tokio::time::timeout(Duration::from_millis(TIMEOUT as u64), recorder.status());
-        if let Ok(status) = status.await {
-            match status {
-                Ok(status) => panic!("`parec` exited with status {}", status),
-                Err(e) => panic!("Failed to check `parec`'s status: {}", e),
-            };
-        }
-        // discard accumulated bytes
-        if let Some(stdout) = recorder.stdout.as_mut() {
-            let mut buffer = vec![0; 48 * TIMEOUT * 2 * 4];
-            let _ = stdout.read_exact(&mut buffer);
-        }
-        let source = Input::new(
-            true,
-            recorder.into(),
-            Codec::FloatPcm,
-            Container::Raw,
-            Default::default(),
-        );
-        let mut handler = handler.lock().await;
-        handler.play_source(source);
+    let mut recorder = Command::new("parec")
+        .args(&[
+            "--format=float32le",
+            "--rate=48000",
+            "--channels=2",
+            "-d",
+            source_device,
+            "-r",
+        ])
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn `parec`");
+    // ensure that the process is alive
+    const TIMEOUT: usize = 50;
+    let status = tokio::time::timeout(Duration::from_millis(TIMEOUT as u64), recorder.status());
+    if let Ok(status) = status.await {
+        match status {
+            Ok(status) => panic!("`parec` exited with status {}", status),
+            Err(e) => panic!("Failed to check `parec`'s status: {}", e),
+        };
     }
+    // discard accumulated bytes
+    if let Some(stdout) = recorder.stdout.as_mut() {
+        let mut buffer = vec![0; 48 * TIMEOUT * 2 * 4];
+        let _ = stdout.read_exact(&mut buffer);
+    }
+    let source = Input::new(
+        true,
+        recorder.into(),
+        Codec::FloatPcm,
+        Container::Raw,
+        Default::default(),
+    );
+    let mut handler = handler.lock().await;
+    handler.play_source(source);
+}
 
 #[tokio::main]
 async fn main() {
     let opts = Opts::parse();
-    let mut workers = Vec::new();
     if opts.jack {
-        pa_load_once(&["module-jack-source", "source_name=audst_jack", "client_name=\"Audst\\ REC\""]);
-        let jack = jack::Client::new("Audst", ClientOptions::NO_START_SERVER).expect("Failed to create JACK client").0;
+        pa_load_once(&[
+            "module-jack-source",
+            "source_name=audst_jack",
+            "client_name=\"Audst\\ REC\"",
+        ]);
+        let jack = jack::Client::new("Audst", ClientOptions::NO_START_SERVER)
+            .expect("Failed to create JACK client")
+            .0;
         for name in jack.ports(Some("^Audst REC:"), None, PortFlags::empty()) {
             if let Some(port) = jack.port_by_name(&name) {
-                jack.disconnect(&port).expect("Failed to manipulate port connections");
+                jack.disconnect(&port)
+                    .expect("Failed to manipulate port connections");
             }
         }
     } else {
-        pa_load_once(&["module-null-sink", "sink_name=audst", "sink_properties=device.description=\"Audst\\ REC\""]);
-        workers.push(tokio::task::spawn_blocking(|| {
-            let mut loopback_to = 0;
-            loop {
-                let sinks = {
-                    let mut sinks = vec![
-                        "Don't create loopback".to_owned(),
-                        "@DEFAULT_SINK@".to_owned(),
-                    ];
-                    sinks.extend(pa_get_sinks());
-                    sinks
-                };
-                pa_unload_module(&["module-loopback", "source=audst.monitor"]);
-                if loopback_to != 0 {
-                    pa_load_once(&[
-                        "module-loopback",
-                        "source=audst.monitor",
-                        &format!("sink={}", &sinks[loopback_to]),
-                    ]);
-                }
-                loopback_to = match Select::new()
-                    .with_prompt("Output device")
-                    .items(&sinks)
-                    .default(0)
-                    .clear(true)
-                    .interact() {
-                        Ok(selection) => selection,
-                        Err(_) => break,
-                    };
-            }
-            let _ = console::Term::stderr().show_cursor();
-        }));
+        pa_load_once(&[
+            "module-null-sink",
+            "sink_name=audst",
+            "sink_properties=device.description=\"Audst\\ REC\"",
+        ]);
+        pa_load_once(&[
+            "module-loopback",
+            "source=audst.monitor",
+            "sink=@DEFAULT_SINK@",
+        ]);
     };
     let token = env!("DISCORD_TOKEN");
     let framework = StandardFramework::new();
@@ -179,9 +164,6 @@ async fn main() {
             println!("error: {:?}", err);
         }
         shard_manager.lock().await.shutdown_all().await;
-        for worker in workers {
-            worker.abort();
-        }
     });
     if let Err(err) = client.start().await {
         println!("error: {:?}", err);
