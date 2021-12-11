@@ -162,14 +162,18 @@ async fn main() {
         let mut data = client.data.write().await;
         data.insert::<OptsKey>(opts);
     }
-    workers.push(tokio::spawn(async move {
-        if let Err(err) = client.start().await {
+    let shard_manager = client.shard_manager.clone();
+    tokio::spawn(async move {
+        if let Err(err) = tokio::signal::ctrl_c().await {
             println!("error: {:?}", err);
         }
-    }));
-    tokio::signal::ctrl_c().await.unwrap();
-    for worker in workers {
-        worker.abort();
+        shard_manager.lock().await.shutdown_all().await;
+        for worker in workers {
+            worker.abort();
+        }
+    });
+    if let Err(err) = client.start().await {
+        println!("error: {:?}", err);
     }
 }
 
