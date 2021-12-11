@@ -1,6 +1,7 @@
 #![feature(exit_status_error)]
 use clap::Parser;
 use dialoguer::Select;
+use itertools::Itertools;
 use jack::{ClientOptions, PortFlags};
 use konst::{primitive::parse_u64, unwrap_ctx};
 use serenity::{
@@ -119,6 +120,7 @@ async fn play_source(handler: Arc<tokio::sync::Mutex<Call>>, source_device: &str
 #[tokio::main]
 async fn main() {
     let opts = Opts::parse();
+    let mut workers = Vec::new();
     if opts.jack {
         pa_load_once(&[
             "module-jack-source",
@@ -128,12 +130,19 @@ async fn main() {
         let jack = jack::Client::new("Audst", ClientOptions::NO_START_SERVER)
             .expect("Failed to create JACK client")
             .0;
-        for name in jack.ports(Some("^Audst REC:"), None, PortFlags::empty()) {
+        for name in jack.ports(
+            Some("^Audst REC:"),
+            Some("32 bit float mono audio"),
+            PortFlags::IS_INPUT,
+        ) {
             if let Some(port) = jack.port_by_name(&name) {
                 jack.disconnect(&port)
                     .expect("Failed to manipulate port connections");
             }
         }
+        workers.push(tokio::task::spawn_blocking(move || {
+            select_source_app_jack(&jack)
+        }));
     } else {
         pa_load_once(&[
             "module-null-sink",
@@ -164,9 +173,55 @@ async fn main() {
             println!("error: {:?}", err);
         }
         shard_manager.lock().await.shutdown_all().await;
+        for worker in workers {
+            if let Err(err) = worker.await {
+                println!("error: {:?}", err);
+            }
+        }
     });
     if let Err(err) = client.start().await {
         println!("error: {:?}", err);
+    }
+}
+
+fn select_source_app_jack(jack: &jack::Client) {
+    loop {
+        let _guard = TermGuard;
+        let clients = jack.ports(None, Some("32 bit float mono audio"), PortFlags::IS_OUTPUT);
+        let clients: Vec<_> = clients
+            .iter()
+            .filter_map(|name| name.split(':').next())
+            .unique()
+            .collect();
+        let connect_to = match Select::new()
+            .with_prompt("Application to stream")
+            .report(false)
+            .items(&clients)
+            .interact()
+        {
+            Ok(selection) => clients[selection],
+            Err(_) => return,
+        };
+        for (rec, src) in jack
+            .ports(
+                Some("^Audst REC:"),
+                Some("32 bit float mono audio"),
+                PortFlags::IS_INPUT,
+            )
+            .into_iter()
+            .zip(jack.ports(
+                Some(&format!("^{}:", connect_to)),
+                Some("32 bit float mono audio"),
+                PortFlags::IS_OUTPUT,
+            ))
+        {
+            if let Some(port) = jack.port_by_name(&rec) {
+                jack.disconnect(&port)
+                    .expect("Failed to manipulate port connections");
+            }
+            jack.connect_ports_by_name(&src, &rec)
+                .expect("Failed to manipulate port connections");
+        }
     }
 }
 
@@ -253,5 +308,14 @@ impl<'ch> Future for AsyncExitStatus<'ch> {
             Ok(None) => std::task::Poll::Pending,
             Err(e) => std::task::Poll::Ready(Err(e)),
         }
+    }
+}
+
+struct TermGuard;
+
+impl Drop for TermGuard {
+    fn drop(&mut self) {
+        console::Term::stdout().show_cursor().unwrap();
+        console::Term::stderr().show_cursor().unwrap();
     }
 }
