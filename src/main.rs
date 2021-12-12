@@ -130,16 +130,7 @@ async fn main() {
         let jack = jack::Client::new("Audst", ClientOptions::NO_START_SERVER)
             .expect("Failed to create JACK client")
             .0;
-        for name in jack.ports(
-            Some("^Audst REC:"),
-            Some("32 bit float mono audio"),
-            PortFlags::IS_INPUT,
-        ) {
-            if let Some(port) = jack.port_by_name(&name) {
-                jack.disconnect(&port)
-                    .expect("Failed to manipulate port connections");
-            }
-        }
+        jack_disconnect_input(&jack);
         workers.push(tokio::task::spawn_blocking(move || {
             select_source_app_jack(&jack);
         }));
@@ -191,20 +182,30 @@ fn select_source_app_jack(jack: &jack::Client) {
     loop {
         let _guard = TermGuard;
         let clients = jack.ports(None, Some("32 bit float mono audio"), PortFlags::IS_OUTPUT);
-        let clients: Vec<_> = clients
+        let mut clients: Vec<_> = clients
             .iter()
             .filter_map(|name| name.split(':').next())
             .unique()
             .collect();
+        clients.push("(none)");
+        clients.push("(rescan)");
         let connect_to = match Select::new()
             .with_prompt("Application to stream")
             .report(false)
+            .default(0)
             .items(&clients)
             .interact()
         {
             Ok(selection) => clients[selection],
             Err(_) => return,
         };
+        if connect_to == "(rescan)" {
+            continue;
+        }
+        jack_disconnect_input(jack);
+        if connect_to == "(none)" {
+            continue;
+        }
         for (rec, src) in jack
             .ports(
                 Some("^Audst REC:"),
@@ -218,10 +219,6 @@ fn select_source_app_jack(jack: &jack::Client) {
                 PortFlags::IS_OUTPUT,
             ))
         {
-            if let Some(port) = jack.port_by_name(&rec) {
-                jack.disconnect(&port)
-                    .expect("Failed to manipulate port connections");
-            }
             jack.connect_ports_by_name(&src, &rec)
                 .expect("Failed to manipulate port connections");
         }
@@ -232,14 +229,18 @@ fn select_source_app_pulse() {
     let mut prev_connected = None;
     loop {
         let _guard = TermGuard;
-        let clients = pa_get_sink_inputs();
-        let connect_to = match Select::new()
+        let client_infos = pa_get_sink_inputs();
+        let mut clients: Vec<_> = client_infos.iter().map(|info| info.1.as_str()).collect();
+        clients.push("(none)");
+        clients.push("(rescan)");
+        let (connect_to, client_id) = match Select::new()
             .with_prompt("Application to stream")
             .report(false)
-            .items(&clients.iter().map(|c| &c.1).collect_vec())
+            .default(0)
+            .items(&clients)
             .interact()
         {
-            Ok(selection) => clients[selection].0,
+            Ok(selection) => (clients[selection], client_infos.get(selection)),
             Err(_) => {
                 if let Some(id) = prev_connected {
                     pa_move_sink_inputs(id, "@DEFAULT_SINK@");
@@ -247,12 +248,32 @@ fn select_source_app_pulse() {
                 return;
             }
         };
+        if connect_to == "(rescan)" {
+            continue;
+        }
         if let Some(id) = prev_connected {
             pa_move_sink_inputs(id, "@DEFAULT_SINK@");
         }
+        if connect_to == "(none)" {
+            continue;
+        }
+        let connect_to = client_id.unwrap().0;
         pa_move_sink_inputs(connect_to, "audst");
         prev_connected = Some(connect_to);
     }
+}
+
+fn jack_disconnect_input(jack: &jack::Client) {
+        for name in jack.ports(
+            Some("^Audst REC:"),
+            Some("32 bit float mono audio"),
+            PortFlags::IS_INPUT,
+        ) {
+            if let Some(port) = jack.port_by_name(&name) {
+                jack.disconnect(&port)
+                    .expect("Failed to manipulate port connections");
+            }
+        }
 }
 
 fn pa_load_once(args: &[&str]) {
