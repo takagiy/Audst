@@ -141,7 +141,7 @@ async fn main() {
             }
         }
         workers.push(tokio::task::spawn_blocking(move || {
-            select_source_app_jack(&jack)
+            select_source_app_jack(&jack);
         }));
     } else {
         pa_load_once(&[
@@ -154,6 +154,9 @@ async fn main() {
             "source=audst.monitor",
             "sink=@DEFAULT_SINK@",
         ]);
+        workers.push(tokio::task::spawn_blocking(move || {
+            select_source_app_pulse();
+        }));
     };
     let token = env!("DISCORD_TOKEN");
     let framework = StandardFramework::new();
@@ -225,6 +228,33 @@ fn select_source_app_jack(jack: &jack::Client) {
     }
 }
 
+fn select_source_app_pulse() {
+    let mut prev_connected = None;
+    loop {
+        let _guard = TermGuard;
+        let clients = pa_get_sink_inputs();
+        let connect_to = match Select::new()
+            .with_prompt("Application to stream")
+            .report(false)
+            .items(&clients.iter().map(|c| &c.1).collect_vec())
+            .interact()
+        {
+            Ok(selection) => clients[selection].0,
+            Err(_) => {
+                if let Some(id) = prev_connected {
+                    pa_move_sink_inputs(id, "@DEFAULT_SINK@");
+                }
+                return;
+            }
+        };
+        if let Some(id) = prev_connected {
+            pa_move_sink_inputs(id, "@DEFAULT_SINK@");
+        }
+        pa_move_sink_inputs(connect_to, "audst");
+        prev_connected = Some(connect_to);
+    }
+}
+
 fn pa_load_once(args: &[&str]) {
     if !pa_find_modules(args).is_empty() {
         return;
@@ -281,6 +311,37 @@ fn pa_get_sinks() -> Vec<String> {
         .filter(|name| name != &"audst")
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn pa_move_sink_inputs(app_id: usize, sink: &str) {
+    Command::new("pactl")
+        .args(&["move-sink-input", &app_id.to_string(), sink])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .status()
+        .expect("Failed to move sink input");
+}
+
+fn pa_get_sink_inputs() -> Vec<(usize, String)> {
+    let out = Command::new("pacmd")
+        .args(&["list-sink-inputs"])
+        .stderr(Stdio::inherit())
+        .output()
+        .expect("Failed to get sink inpus");
+    out.status.exit_ok().expect("Failed to get sink inpus");
+    let out = String::from_utf8(out.stdout).expect("Invalid UTF-8");
+
+    let mut result = Vec::new();
+    let mut index = 0;
+    for line in out.lines().map(str::trim) {
+        if let Some(idx) = line.strip_prefix("index:") {
+            index = idx.trim().parse().expect("Index of sink input is invalid");
+        }
+        if let Some(app) = line.strip_prefix("application.name = ") {
+            result.push((index, app.trim().trim_matches('"').to_owned()));
+        }
+    }
+    result
 }
 
 struct AsyncExitStatus<'ch> {
